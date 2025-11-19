@@ -121,6 +121,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
+        println!(
+            "lde_values: num_polys={}, degree={}, blinding={}, salt_size={}",
+            polynomials.len(),
+            degree,
+            blinding,
+            salt_size
+        );
 
         polynomials
             .par_iter()
