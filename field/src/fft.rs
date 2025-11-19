@@ -32,8 +32,47 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
-#[inline]
 fn fft_dispatch<F: Field>(
+    input: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        use zeknox::init_twiddle_factors_rs;
+
+        // todo: move this to somewhere else to avoid re-initialization
+        init_twiddle_factors_rs(0, input.len().trailing_zeros() as usize);
+        fft_dispatch_gpu(input, zero_factor, root_table);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        fft_dispatch_cpu(input, zero_factor, root_table);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn fft_dispatch_gpu<F: Field>(
+    input: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    use zeknox::ntt_batch;
+    use zeknox::types::NTTConfig;
+    if F::CUDA_SUPPORT {
+        return ntt_batch(
+            0,
+            input.as_mut_ptr(),
+            input.len().trailing_zeros() as usize,
+            NTTConfig::default(),
+        );
+    } else {
+        return fft_dispatch_cpu(input, zero_factor, root_table);
+    }
+}
+
+#[inline]
+fn fft_dispatch_cpu<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,

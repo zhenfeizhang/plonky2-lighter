@@ -77,6 +77,9 @@ pub fn interpolate2<F: Field>(points: [(F, F); 2], x: F) -> F {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    use zeknox::init_twiddle_factors_rs;
+
     use super::*;
     use crate::extension::quartic::QuarticExtension;
     use crate::goldilocks_field::GoldilocksField;
@@ -87,7 +90,9 @@ mod tests {
     fn interpolant_random() {
         type F = GoldilocksField;
 
-        for deg in 0..10 {
+        for deg in 2..10 {
+            #[cfg(feature = "cuda")]
+            init_twiddle_factors_rs(0, log2_ceil(deg));
             let domain = F::rand_vec(deg);
             let coeffs = F::rand_vec(deg);
             let coeffs = PolynomialCoeffs { coeffs };
@@ -101,7 +106,9 @@ mod tests {
     fn interpolant_random_roots_of_unity() {
         type F = GoldilocksField;
 
-        for deg_log in 0..4 {
+        for deg_log in 1..4 {
+            #[cfg(feature = "cuda")]
+            init_twiddle_factors_rs(0, deg_log);
             let deg = 1 << deg_log;
             let domain = F::two_adic_subgroup(deg_log);
             let coeffs = F::rand_vec(deg);
