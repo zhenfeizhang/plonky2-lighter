@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     let initial_b = builder.add_virtual_target();
     let mut prev_target = initial_a;
     let mut cur_target = initial_b;
-    for _ in 0..99 {
+    for _ in 0..999999 {
         let temp = builder.add(prev_target, cur_target);
         prev_target = cur_target;
         cur_target = temp;
