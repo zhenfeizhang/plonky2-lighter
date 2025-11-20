@@ -5,12 +5,6 @@ use core::slice;
 
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
-
-use crate::hash::hash_types::RichField;
-use crate::hash::merkle_proofs::MerkleProof;
-use crate::plonk::config::{GenericHashOut, Hasher};
-use crate::util::log2_strict;
-
 #[cfg(feature = "cuda")]
 use zeknox::device::{memory::HostOrDeviceSlice, stream::CudaStream};
 #[cfg(feature = "cuda")]
@@ -18,8 +12,12 @@ use zeknox::{
     fill_digests_buf_linear_gpu_with_gpu_ptr, fill_digests_buf_linear_multigpu_with_gpu_ptr,
 };
 
+use crate::hash::hash_types::RichField;
 #[cfg(feature = "cuda")]
 use crate::hash::hash_types::NUM_HASH_OUT_ELTS;
+use crate::hash::merkle_proofs::MerkleProof;
+use crate::plonk::config::{GenericHashOut, Hasher};
+use crate::util::log2_strict;
 
 /// The Merkle cap of height `h` of a Merkle tree is the `h`-th layer (from the root) of the tree.
 /// It can be used in place of the root to verify Merkle paths, which are `h` elements shorter.
@@ -158,7 +156,6 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     );
 }
 
-
 #[cfg(feature = "cuda")]
 fn fill_digests_buf_gpu_ptr<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
@@ -259,7 +256,6 @@ fn fill_digests_buf_gpu<F: RichField, H: Hasher<F>>(
     leaf_size: usize,
     cap_height: usize,
 ) {
-    println!("Filling Merkle tree digests using GPU acceleration.");
     let leaves_count = leaves.len() / leaf_size;
     let gpu_id = 0;
 
@@ -277,7 +273,6 @@ fn fill_digests_buf_gpu<F: RichField, H: Hasher<F>>(
         cap_height,
         gpu_id,
     );
-    println!("Filled.");
 }
 
 pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
@@ -321,8 +316,86 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
         .collect()
 }
 
+/// Recursively swap digests to convert from GPU's bottom-up layout to CPU's recursive layout.
+/// This mirrors the structure of fill_subtree.
+#[cfg(feature = "cuda")]
+fn swap_digest_pairs_recursive<F: RichField, H: Hasher<F>>(
+    digests: &mut Vec<H::Hash>,
+    cpu_offset: usize,
+    cpu_size: usize,
+    gpu_offset: &mut usize,
+) {
+    if cpu_size == 0 {
+        return;
+    }
+
+    // CPU layout: [left_subtree || left_child || right_child || right_subtree]
+    let mid = cpu_offset + cpu_size / 2;
+    let left_subtree_size = cpu_size / 2 - 1;
+    let right_subtree_size = cpu_size / 2 - 1;
+
+    // Process left subtree recursively
+    swap_digest_pairs_recursive::<F, H>(digests, cpu_offset, left_subtree_size, gpu_offset);
+
+    // Process right subtree recursively
+    swap_digest_pairs_recursive::<F, H>(digests, mid + 1, right_subtree_size, gpu_offset);
+
+    // Now handle the two children at this level
+    // In GPU layout, they are at positions gpu_offset and gpu_offset+1
+    // In CPU layout, they should be at mid-1 (left child) and mid (right child)
+
+    // Create temp copies
+    let left_gpu_value = digests[*gpu_offset].clone();
+    let right_gpu_value = digests[*gpu_offset + 1].clone();
+
+    // Place them in CPU positions
+    digests[mid - 1] = left_gpu_value;
+    digests[mid] = right_gpu_value;
+
+    *gpu_offset += 2;
+}
+
+// /// Swap digest pairs to convert from GPU's bottom-up layout to CPU's recursive layout.
+// #[cfg(feature = "cuda")]
+// fn swap_digest_pairs<F: RichField, H: Hasher<F>>(
+//     digests: &mut Vec<H::Hash>,
+//     offset: usize,
+//     size: usize,
+//     num_leaves: usize,
+// ) {
+//     // Create a copy of the GPU layout
+//     let mut temp = digests[offset..offset + size].to_vec();
+
+//     // Apply recursive swapping
+//     let mut gpu_pos = 0;
+//     swap_digest_pairs_recursive::<F, H>(&mut temp, 0, size - num_leaves, &mut gpu_pos);
+
+//     // Copy back the rearranged digests (only internal nodes, leaves stay the same)
+//     for i in 0..(size - num_leaves) {
+//         digests[offset + i] = temp[i].clone();
+//     }
+// }
+
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            let res1 = Self::new_gpu(leaves.clone(), cap_height);
+            {
+                // todo: remove me.
+                let res2 = Self::new_cpu(leaves, cap_height);
+                assert_eq!(res1, res2, "Merkle tree caps from GPU and CPU do not match");
+            }
+            res1
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::new_cpu(leaves, cap_height)
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn new_gpu(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
         let log2_leaves_len = log2_strict(leaves.len());
         assert!(
             cap_height <= log2_leaves_len,
@@ -340,48 +413,80 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
         println!(
-            "Constructing Merkle tree with {} leaves and cap height {}",
+            "[Cuda] Constructing Merkle tree with {} leaves and cap height {}",
             leaves.len(),
             cap_height
         );
-        #[cfg(feature = "cuda")]
-        {   
-            println!("CUDA feature is enabled.");
-            // Check if we should use GPU acceleration
-            // Use GPU for large trees (>= 1024 leaves) or if CUDA_MERKLE_THRESHOLD is set
-            let use_gpu = if let Ok(threshold_str) = std::env::var("CUDA_MERKLE_THRESHOLD") {
-                if let Ok(threshold) = threshold_str.parse::<usize>() {
-                    leaves.len() >= threshold
-                } else {
-                    leaves.len() >= 1024
-                }
-            } else {
-                leaves.len() >= 1024
-            };
 
-            if use_gpu {
-                // Flatten leaves into 1D vector for GPU
-                let leaf_size = if leaves.is_empty() { 0 } else { leaves[0].len() };
-                let zeros = vec![F::ZERO; leaf_size];
-                let mut leaves_1d: Vec<F> = Vec::with_capacity(leaves.len() * leaf_size);
-                for leaf in &leaves {
-                    if leaf.is_empty() {
-                        leaves_1d.extend(zeros.clone());
-                    } else {
-                        leaves_1d.extend(leaf.clone());
-                    }
-                }
-
-                fill_digests_buf_gpu::<F, H>(digests_buf, cap_buf, &leaves_1d, leaf_size, cap_height);
+        // Flatten leaves into 1D vector for GPU
+        let leaf_size = if leaves.is_empty() {
+            0
+        } else {
+            leaves[0].len()
+        };
+        let zeros = vec![F::ZERO; leaf_size];
+        let mut leaves_1d: Vec<F> = Vec::with_capacity(leaves.len() * leaf_size);
+        for leaf in &leaves {
+            if leaf.is_empty() {
+                leaves_1d.extend(zeros.clone());
             } else {
-                fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height);
+                leaves_1d.extend(leaf.clone());
             }
         }
 
-        #[cfg(not(feature = "cuda"))]
-        {
-            fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height);
+        fill_digests_buf_gpu::<F, H>(digests_buf, cap_buf, &leaves_1d, leaf_size, cap_height);
+
+        unsafe {
+            // SAFETY: `fill_digests_buf` and `cap` initialized the spare capacity up to
+            // `num_digests` and `len_cap`, resp.
+            digests.set_len(num_digests);
+            cap.set_len(len_cap);
         }
+
+        // // Fix the digest order: GPU uses bottom-up, CPU uses recursive layout
+        // // Pattern observed: within each subtree, we need to swap pairs
+        // let subtree_count = 1 << cap_height;
+        // let subtree_leaves = leaves.len() >> cap_height;
+        // let subtree_digests = num_digests / subtree_count;
+
+        // // For each subtree, apply swaps based on the recursive structure
+        // for subtree_idx in 0..subtree_count {
+        //     let offset = subtree_idx * subtree_digests;
+        //     swap_digest_pairs::<F, H>(&mut digests, offset, subtree_digests, subtree_leaves);
+        // }
+
+        Self {
+            leaves,
+            digests,
+            cap: MerkleCap(cap),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn new_cpu(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        let log2_leaves_len = log2_strict(leaves.len());
+        assert!(
+            cap_height <= log2_leaves_len,
+            "cap_height={} should be at most log2(leaves.len())={}",
+            cap_height,
+            log2_leaves_len
+        );
+
+        let num_digests = 2 * (leaves.len() - (1 << cap_height));
+        let mut digests = Vec::with_capacity(num_digests);
+
+        let len_cap = 1 << cap_height;
+        let mut cap = Vec::with_capacity(len_cap);
+
+        let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+        let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
+        println!(
+            "[CPU]  Constructing Merkle tree with {} leaves and cap height {}",
+            leaves.len(),
+            cap_height
+        );
+
+        fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height);
         unsafe {
             // SAFETY: `fill_digests_buf` and `cap` initialized the spare capacity up to
             // `num_digests` and `len_cap`, resp.
@@ -417,6 +522,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::field::extension::Extendable;
     use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
+    use crate::hash::poseidon::Poseidon;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
@@ -479,6 +585,38 @@ pub(crate) mod tests {
         let leaves = random_data::<F>(n, 7);
 
         verify_all_leaves::<F, C, D>(leaves, 1)?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_merkle_trees_consistency() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+
+        for log_n in 3..25 {
+            let n = 1 << log_n;
+            let leaves = random_data::<F>(n, 7);
+
+            let tree_cpu =
+                MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_cpu(leaves.clone(), 1);
+            let tree_gpu =
+                MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_gpu(leaves.clone(), 1);
+
+            tree_cpu.cap.0.iter().zip(tree_gpu.cap.0.iter()).for_each(|(a, b)| {
+                assert_eq!(a, b, "Cap mismatch between CPU and GPU implementations");
+            });
+
+            tree_cpu.digests.iter().zip(tree_gpu.digests.iter()).enumerate().for_each(|(i, (a, b))| {
+                if a != b {
+                    println!("Digest mismatch at index {}: {:?} {:?}", i, a, b  );
+                }
+            });
+
+            assert_eq!(tree_cpu, tree_gpu);
+        }
 
         Ok(())
     }
