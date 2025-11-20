@@ -1,27 +1,27 @@
-#[cfg(feature = "cuda")]
-use alloc::sync::Arc;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::slice;
 use std::collections::HashSet;
 #[cfg(feature = "cuda")]
+use std::sync::Arc;
+#[cfg(feature = "cuda")]
 use std::sync::Mutex;
 use std::time::Instant;
+#[cfg(not(feature = "std"))]
+use std::vec::Vec;
 
-#[cfg(feature = "cuda")]
-use cryptography_cuda::device::memory::HostOrDeviceSlice;
-#[cfg(feature = "cuda")]
-use cryptography_cuda::device::stream::CudaStream;
-#[cfg(feature = "cuda")]
-use cryptography_cuda::merkle::bindings::{
-    fill_digests_buf_linear_gpu_with_gpu_ptr, fill_digests_buf_linear_multigpu_with_gpu_ptr,
-};
 use num::range;
 #[cfg(feature = "cuda")]
 use once_cell::sync::Lazy;
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cuda")]
+use zeknox::device::memory::HostOrDeviceSlice;
+#[cfg(feature = "cuda")]
+use zeknox::device::stream::CudaStream;
+#[cfg(feature = "cuda")]
+use zeknox::fill_digests_buf_linear_gpu_with_gpu_ptr;
+#[cfg(feature = "cuda")]
+use zeknox::fill_digests_buf_linear_multigpu_with_gpu_ptr;
 
 use crate::hash::hash_types::RichField;
 #[cfg(feature = "cuda")]
@@ -35,12 +35,12 @@ use crate::util::log2_strict;
 #[cfg(feature = "cuda")]
 pub static GPU_ID: Lazy<Arc<Mutex<u64>>> = Lazy::new(|| Arc::new(Mutex::new(0)));
 
-#[cfg(feature = "cuda_timing")]
+#[cfg(all(feature = "timing", feature = "cuda"))]
 fn print_time(now: Instant, msg: &str) {
     println!("Time {} {} ms", msg, now.elapsed().as_millis());
 }
 
-#[cfg(not(feature = "cuda_timing"))]
+#[cfg(not(all(feature = "timing", feature = "cuda")))]
 fn print_time(_now: Instant, _msg: &str) {}
 
 #[cfg(feature = "cuda")]
@@ -445,7 +445,7 @@ fn fill_digests_buf_meta<F: RichField, H: Hasher<F>>(
     cap_height: usize,
 ) {
     // if the input is small or if it Keccak hashing, just do the hashing on CPU
-    if leaf_size <= H::HASH_SIZE / 8 || H::HASHER_TYPE == HasherType::Keccak {
+    if leaf_size <= H::HASH_SIZE / 8 {
         fill_digests_buf::<F, H>(digests_buf, cap_buf, leaves, leaf_size, cap_height);
     } else {
         fill_digests_buf_gpu::<F, H>(digests_buf, cap_buf, leaves, leaf_size, cap_height);
